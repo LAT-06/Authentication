@@ -1,68 +1,51 @@
-import base64
-import hmac
-from flask import Flask, request, Response
+from flask import Flask, request, jsonify
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 app = Flask(__name__)
 
-# Giả lập Database (plaintext chỉ để demo)
-USERS_DB = {
-    "admin": "123"
-}
+# BẬT TÍNH NĂNG NÀY: Rate Limiting để chống Brute-force.
+# NẾU KHÔNG BẬT: Attacker có thể thử hàng triệu password mỗi phút cho đến khi đúng.
+limiter = Limiter(get_remote_address, app=app, default_limits=["200 per day", "50 per hour"])
 
-def safe_compare(val1: str, val2: str) -> bool:
-    """
-    So sánh constant-time để tránh timing attack.
-    Luôn nhận vào string (không bao giờ None).
-    """
-    return hmac.compare_digest(val1.encode('utf-8'), val2.encode('utf-8'))
+# Áp dụng SRP: Lớp chịu trách nhiệm tương tác dữ liệu (Mô phỏng Database)
+class UserRepository:
+    def __init__(self):
+        # BẬT TÍNH NĂNG NÀY: Hash password thay vì lưu plaintext.
+        # NẾU KHÔNG BẬT: Database bị leak là mất toàn bộ mật khẩu gốc của user.
+        self._users = {
+            "admin": generate_password_hash("SuperSecret123")
+        }
 
-def require_basic_auth():
-    """
-    Trả về 401 + header chuẩn để trigger browser popup.
-    """
-    return Response(
-        "Unauthorized Access\n",
-        401,
-        {"WWW-Authenticate": 'Basic realm="Restricted_Zone"'}
-    )
+    def get_user_hash(self, username: str) -> str:
+        return self._users.get(username)
 
-def extract_and_verify(auth_header: str) -> bool:
-    """
-    Decode + verify credentials.
-    Không bao giờ để None đi vào compare.
-    """
-    try:
-        # "Basic base64string"
-        parts = auth_header.split(" ", 1)
-        if len(parts) != 2:
+# Áp dụng SRP & DIP: Lớp chịu trách nhiệm xác thực, nhận dependency từ bên ngoài
+class BasicAuthenticator:
+    def __init__(self, user_repo: UserRepository):
+        self.user_repo = user_repo
+
+    def authenticate(self, username, password) -> bool:
+        user_hash = self.user_repo.get_user_hash(username)
+        if not user_hash:
             return False
+        return check_password_hash(user_hash, password)
 
-        encoded_credentials = parts[1]
-        decoded_bytes = base64.b64decode(encoded_credentials)
-        decoded_string = decoded_bytes.decode("utf-8")
+# Khởi tạo dependencies
+repo = UserRepository()
+authenticator = BasicAuthenticator(repo)
 
-        # username:password
-        username, password = decoded_string.split(":", 1)
+@app.route('/secure-data')
+@limiter.limit("5 per minute")
+def secure_data():
+    auth = request.authorization
+    
+    if not auth or not authenticator.authenticate(auth.username, auth.password):
+        # Đã sửa: Trả về thêm header WWW-Authenticate để trình duyệt biết và gọi popup
+        return jsonify({"error": "Unauthorized"}), 401, {'WWW-Authenticate': 'Basic realm="Login Required"'}
+    
+    return jsonify({"message": "Successfully", "data": "Your Mom Weight"})
 
-        # Nếu user không tồn tại → dùng empty string để giữ timing gần giống
-        expected_password = USERS_DB.get(username, "")
-
-        return safe_compare(password, expected_password)
-
-    except Exception:
-        return False
-
-@app.route("/dashboard")
-def dashboard():
-    auth_header = request.headers.get("Authorization")
-
-    if not auth_header or not auth_header.startswith("Basic "):
-        return require_basic_auth()
-
-    if extract_and_verify(auth_header):
-        return "Welcome to the Dashboard!"
-    else:
-        return require_basic_auth()
-
-if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+if __name__ == '__main__':
+    app.run(port=5000)
